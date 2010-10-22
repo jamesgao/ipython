@@ -40,6 +40,7 @@ from IPython.core import shadowns
 from IPython.core import ultratb
 from IPython.core.alias import AliasManager
 from IPython.core.builtin_trap import BuiltinTrap
+from IPython.core.compilerop import CachingCompiler
 from IPython.core.display_trap import DisplayTrap
 from IPython.core.displayhook import DisplayHook
 from IPython.core.error import TryNext, UsageError
@@ -135,7 +136,6 @@ class MultipleInstanceError(Exception):
 #-----------------------------------------------------------------------------
 # Main IPython class
 #-----------------------------------------------------------------------------
-
 
 class InteractiveShell(Configurable, Magic):
     """An enhanced, interactive shell for Python."""
@@ -369,8 +369,8 @@ class InteractiveShell(Configurable, Magic):
         self.more = False
 
         # command compiler
-        self.compile = codeop.CommandCompiler()
-
+        self.compile = CachingCompiler()
+        
         # User input buffers
         # NOTE: these variables are slated for full removal, once we are 100%
         # sure that the new execution logic is solid.  We will delte runlines,
@@ -819,8 +819,11 @@ class InteractiveShell(Configurable, Magic):
 
         # Similarly, track all namespaces where references can be held and that
         # we can safely clear (so it can NOT include builtin).  This one can be
-        # a simple list.
-        self.ns_refs_table = [ user_ns, user_global_ns, self.user_ns_hidden,
+        # a simple list.  Note that the main execution namespaces, user_ns and
+        # user_global_ns, can NOT be listed here, as clearing them blindly
+        # causes errors in object __del__ methods.  Instead, the reset() method
+        # clears them manually and carefully.
+        self.ns_refs_table = [ self.user_ns_hidden,
                                self.internal_ns, self._main_ns_cache ]
 
     def make_user_namespaces(self, user_ns=None, user_global_ns=None):
@@ -985,6 +988,18 @@ class InteractiveShell(Configurable, Magic):
         # Restore the user namespaces to minimal usability
         for ns in self.ns_refs_table:
             ns.clear()
+
+        # The main execution namespaces must be cleared very carefully,
+        # skipping the deletion of the builtin-related keys, because doing so
+        # would cause errors in many object's __del__ methods.
+        for ns in [self.user_ns, self.user_global_ns]:
+            drop_keys = set(ns.keys())
+            drop_keys.discard('__builtin__')
+            drop_keys.discard('__builtins__')
+            for k in drop_keys:
+                del ns[k]
+                                        
+        # Restore the user namespaces to minimal usability
         self.init_user_ns()
 
         # Restore the default and user aliases
@@ -1101,7 +1116,7 @@ class InteractiveShell(Configurable, Magic):
         # We need to special-case 'print', which as of python2.6 registers as a
         # function but should only be treated as one if print_function was
         # loaded with a future import.  In this case, just bail.
-        if (oname == 'print' and not (self.compile.compiler.flags &
+        if (oname == 'print' and not (self.compile.compiler_flags &
                                       __future__.CO_FUTURE_PRINT_FUNCTION)):
             return {'found':found, 'obj':obj, 'namespace':ospace,
                     'ismagic':ismagic, 'isalias':isalias, 'parent':parent}
@@ -1260,7 +1275,8 @@ class InteractiveShell(Configurable, Magic):
         # internal code. Valid modes: ['Plain','Context','Verbose']
         self.InteractiveTB = ultratb.AutoFormattedTB(mode = 'Plain',
                                                      color_scheme='NoColor',
-                                                     tb_offset = 1)
+                                                     tb_offset = 1,
+                                   check_cache=self.compile.check_cache)
 
         # The instance will store a pointer to the system-wide exception hook,
         # so that runtime code (such as magics) can access it.  This is because
@@ -2126,14 +2142,15 @@ class InteractiveShell(Configurable, Magic):
 
                 # Get the main body to run as a cell
                 ipy_body = ''.join(blocks[:-1])
-                retcode = self.run_code(ipy_body, post_execute=False)
+                retcode = self.run_source(ipy_body, symbol='exec',
+                                          post_execute=False)
                 if retcode==0:
                     # And the last expression via runlines so it produces output
                     self.run_one_block(last)
             else:
                 # Run the whole cell as one entity, storing both raw and
                 # processed input in history
-                self.run_code(ipy_cell)
+                self.run_source(ipy_cell, symbol='exec')
 
         # Each cell is a *single* input, regardless of how many lines it has
         self.execution_count += 1
@@ -2162,6 +2179,8 @@ class InteractiveShell(Configurable, Magic):
         tline = self.prefilter_manager.prefilter_line(line)
         return self.run_source(tline)
 
+    # PENDING REMOVAL: this method is slated for deletion, once our new
+    # input logic has been 100% moved to frontends and is stable.
     def runlines(self, lines, clean=False):
         """Run a string of one or more lines of source.
 
@@ -2207,7 +2226,8 @@ class InteractiveShell(Configurable, Magic):
             if more:
                 self.push_line('\n')
 
-    def run_source(self, source, filename='<ipython console>', symbol='single'):
+    def run_source(self, source, filename=None,
+                   symbol='single', post_execute=True):
         """Compile and run some source in the interpreter.
 
         Arguments are as for compile_command().
@@ -2249,7 +2269,7 @@ class InteractiveShell(Configurable, Magic):
             print 'encoding', self.stdin_encoding  # dbg
         
         try:
-            code = self.compile(usource,filename,symbol)
+            code = self.compile(usource, symbol, self.execution_count)
         except (OverflowError, SyntaxError, ValueError, TypeError, MemoryError):
             # Case 1
             self.showsyntaxerror(filename)
@@ -2266,7 +2286,7 @@ class InteractiveShell(Configurable, Magic):
         # buffer attribute as '\n'.join(self.buffer).
         self.code_to_run = code
         # now actually execute the code object
-        if self.run_code(code) == 0:
+        if self.run_code(code, post_execute) == 0:
             return False
         else:
             return None
@@ -2339,7 +2359,9 @@ class InteractiveShell(Configurable, Magic):
         
     # For backwards compatibility
     runcode = run_code
-    
+
+    # PENDING REMOVAL: this method is slated for deletion, once our new
+    # input logic has been 100% moved to frontends and is stable.
     def push_line(self, line):
         """Push a line to the interpreter.
 
@@ -2443,7 +2465,7 @@ class InteractiveShell(Configurable, Magic):
                           sys._getframe(depth+1).f_locals # locals
                           ))
 
-    def mktempfile(self,data=None):
+    def mktempfile(self, data=None, prefix='ipython_edit_'):
         """Make a new tempfile and return its filename.
 
         This makes a call to tempfile.mktemp, but it registers the created
@@ -2454,7 +2476,7 @@ class InteractiveShell(Configurable, Magic):
           - data(None): if data is given, it gets written out to the temp file
           immediately, and the file is closed again."""
 
-        filename = tempfile.mktemp('.py','ipython_edit_')
+        filename = tempfile.mktemp('.py', prefix)
         self.tempfiles.append(filename)
         
         if data:
