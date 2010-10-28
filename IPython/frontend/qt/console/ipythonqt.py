@@ -7,12 +7,13 @@
 
 # Systemm library imports
 from PyQt4 import QtGui
-
+from pygments.styles import get_all_styles
 # Local imports
 from IPython.external.argparse import ArgumentParser
 from IPython.frontend.qt.console.frontend_widget import FrontendWidget
 from IPython.frontend.qt.console.ipython_widget import IPythonWidget
 from IPython.frontend.qt.console.rich_ipython_widget import RichIPythonWidget
+from IPython.frontend.qt.console import styles
 from IPython.frontend.qt.kernelmanager import QtKernelManager
 
 #-----------------------------------------------------------------------------
@@ -57,52 +58,71 @@ class MainWindow(QtGui.QMainWindow):
     #---------------------------------------------------------------------------
     
     def closeEvent(self, event):
-        """ Reimplemented to prompt the user and close the kernel cleanly.
+        """ Close the window and the kernel (if necessary).
+        
+        This will prompt the user if they are finished with the kernel, and if
+        so, closes the kernel cleanly. Alternatively, if the exit magic is used,
+        it closes without prompt.
         """
+        keepkernel = None #Use the prompt by default
+        if hasattr(self._frontend,'_keep_kernel_on_exit'): #set by exit magic
+            keepkernel = self._frontend._keep_kernel_on_exit
+        
         kernel_manager = self._frontend.kernel_manager
-        if kernel_manager and kernel_manager.channels_running:
-            title = self.window().windowTitle()
-            cancel = QtGui.QMessageBox.Cancel
-            okay = QtGui.QMessageBox.Ok
-            if self._may_close:
-                msg = "You are closing this Console window."
-                info = "Would you like to quit the Kernel and all attached Consoles as well?"
-                justthis = QtGui.QPushButton("&No, just this Console", self)
-                justthis.setShortcut('N')
-                closeall = QtGui.QPushButton("&Yes, quit everything", self)
-                closeall.setShortcut('Y')
-                box = QtGui.QMessageBox(QtGui.QMessageBox.Question, title, msg)
-                box.setInformativeText(info)
-                box.addButton(cancel)
-                box.addButton(justthis, QtGui.QMessageBox.NoRole)
-                box.addButton(closeall, QtGui.QMessageBox.YesRole)
-                box.setDefaultButton(closeall)
-                box.setEscapeButton(cancel)
-                reply = box.exec_()
-                if reply == 1: # close All
-                    kernel_manager.shutdown_kernel()
-                    #kernel_manager.stop_channels()
-                    event.accept()
-                elif reply == 0: # close Console
-                    if not self._existing:
-                        # I have the kernel: don't quit, just close the window
-                        self._app.setQuitOnLastWindowClosed(False)
-                        self.deleteLater()
-                    event.accept()
+        
+        if keepkernel is None: #show prompt
+            if kernel_manager and kernel_manager.channels_running:
+                title = self.window().windowTitle()
+                cancel = QtGui.QMessageBox.Cancel
+                okay = QtGui.QMessageBox.Ok
+                if self._may_close:
+                    msg = "You are closing this Console window."
+                    info = "Would you like to quit the Kernel and all attached Consoles as well?"
+                    justthis = QtGui.QPushButton("&No, just this Console", self)
+                    justthis.setShortcut('N')
+                    closeall = QtGui.QPushButton("&Yes, quit everything", self)
+                    closeall.setShortcut('Y')
+                    box = QtGui.QMessageBox(QtGui.QMessageBox.Question, title, msg)
+                    box.setInformativeText(info)
+                    box.addButton(cancel)
+                    box.addButton(justthis, QtGui.QMessageBox.NoRole)
+                    box.addButton(closeall, QtGui.QMessageBox.YesRole)
+                    box.setDefaultButton(closeall)
+                    box.setEscapeButton(cancel)
+                    reply = box.exec_()
+                    if reply == 1: # close All
+                        kernel_manager.shutdown_kernel()
+                        #kernel_manager.stop_channels()
+                        event.accept()
+                    elif reply == 0: # close Console
+                        if not self._existing:
+                            # Have kernel: don't quit, just close the window
+                            self._app.setQuitOnLastWindowClosed(False)
+                            self.deleteLater()
+                        event.accept()
+                    else:
+                        event.ignore()
                 else:
-                    event.ignore()
-            else:
-                reply = QtGui.QMessageBox.question(self, title,
-                    "Are you sure you want to close this Console?"+
-                    "\nThe Kernel and other Consoles will remain active.",
-                    okay|cancel,
-                    defaultButton=okay
-                    )
-                if reply == okay:
-                    event.accept()
-                else:
-                    event.ignore()
-            
+                    reply = QtGui.QMessageBox.question(self, title,
+                        "Are you sure you want to close this Console?"+
+                        "\nThe Kernel and other Consoles will remain active.",
+                        okay|cancel,
+                        defaultButton=okay
+                        )
+                    if reply == okay:
+                        event.accept()
+                    else:
+                        event.ignore()
+        elif keepkernel: #close console but leave kernel running (no prompt)
+            if kernel_manager and kernel_manager.channels_running:
+                if not self._existing:
+                    # I have the kernel: don't quit, just close the window
+                    self._app.setQuitOnLastWindowClosed(False)
+                event.accept()
+        else: #close console and kernel (no prompt)
+            if kernel_manager and kernel_manager.channels_running:
+                kernel_manager.shutdown_kernel()
+                event.accept()
 
 #-----------------------------------------------------------------------------
 # Main entry point
@@ -129,7 +149,7 @@ def main():
     kgroup.add_argument('--rep', type=int, metavar='PORT', default=0,
                         help='set the REP channel port [default random]')
     kgroup.add_argument('--hb', type=int, metavar='PORT', default=0,
-                        help='set the heartbeat port [default: random]')
+                        help='set the heartbeat port [default random]')
 
     egroup = kgroup.add_mutually_exclusive_group()
     egroup.add_argument('--pure', action='store_true', help = \
@@ -148,8 +168,35 @@ def main():
                         help='enable rich text support')
     wgroup.add_argument('--gui-completion', action='store_true',
                         help='use a GUI widget for tab completion')
+    wgroup.add_argument('--style', type=str,
+                        choices = list(get_all_styles()),
+                        help='specify a pygments style for by name.')
+    wgroup.add_argument('--stylesheet', type=str,
+                        help="path to a custom CSS stylesheet.")
+    wgroup.add_argument('--colors', type=str,
+                        help="Set the color scheme (LightBG,Linux,NoColor). This is guessed\
+                        based on the pygments style if not set.")
 
     args = parser.parse_args()
+
+    # parse the colors arg down to current known labels
+    if args.colors:
+        colors=args.colors.lower()
+        if colors in ('lightbg', 'light'):
+            colors='lightbg'
+        elif colors in ('dark', 'linux'):
+            colors='linux'
+        else:
+            colors='nocolor'
+    elif args.style:
+        if args.style=='bw':
+            colors='nocolor'
+        elif styles.dark_style(args.style):
+            colors='linux'
+        else:
+            colors='lightbg'
+    else:
+        colors=None
 
     # Don't let Qt or ZMQ swallow KeyboardInterupts.
     import signal
@@ -163,13 +210,15 @@ def main():
     if not args.existing:
         # if not args.ip in LOCAL_IPS+ALL_ALIAS:
         #     raise ValueError("Must bind a local ip, such as: %s"%LOCAL_IPS)
-        
+
         kwargs = dict(ip=args.ip)
         if args.pure:
             kwargs['ipython']=False
-        elif args.pylab:
-            kwargs['pylab']=args.pylab
-            
+        else:
+            kwargs['colors']=colors
+            if args.pylab:
+                kwargs['pylab']=args.pylab
+
         kernel_manager.start_kernel(**kwargs)
     kernel_manager.start_channels()
 
@@ -185,6 +234,31 @@ def main():
         widget = IPythonWidget(paging=args.paging, local_kernel=local_kernel)
     widget.gui_completion = args.gui_completion
     widget.kernel_manager = kernel_manager
+
+    # configure the style:
+    if not args.pure: # only IPythonWidget supports styles
+        if args.style:
+            widget.syntax_style = args.style
+            widget.style_sheet = styles.sheet_from_template(args.style, colors)
+            widget._syntax_style_changed()
+            widget._style_sheet_changed()
+        elif colors:
+            # use a default style
+            widget.set_default_style(colors=colors)
+        else:
+            # this is redundant for now, but allows the widget's
+            # defaults to change
+            widget.set_default_style()
+
+        if args.stylesheet:
+            # we got an expicit stylesheet
+            if os.path.isfile(args.stylesheet):
+                with open(args.stylesheet) as f:
+                    sheet = f.read()
+                widget.style_sheet = sheet
+                widget._style_sheet_changed()
+            else:
+                raise IOError("Stylesheet %r not found."%args.stylesheet)
 
     # Create the main window.
     window = MainWindow(app, widget, args.existing, may_close=local_kernel)
